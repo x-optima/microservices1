@@ -1,0 +1,84 @@
+# Стенд задачи 3: API Gateway (NGINX) + security + uploader + S3-хранилище minio.
+# Запуск: docker compose up --build — шлюз доступен на http://localhost.
+# Переменные ${Storage_*} подставляются из файла .env рядом с compose-файлом.
+
+services:
+  # S3-хранилище: держит загруженные картинки в бакете images.
+  storage:
+    image: minio/minio:latest
+    container_name: storage
+    # `server` поднимает S3-API, /data — рабочий каталог для объектов.
+    command: server /data
+    # expose открывает порт только внутри compose-сети,
+    # наружу minio недоступен — весь трафик идёт через шлюз.
+    expose:
+      - "9000"
+    environment:
+      MINIO_ROOT_USER: ${Storage_AccessKey}
+      MINIO_ROOT_PASSWORD: ${Storage_Secret}
+    volumes:
+      # Именованный том: объекты переживают пересоздание контейнера.
+      - storage-data:/data
+    healthcheck:
+      # Остальные сервисы ждут готовности minio (service_healthy).
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+
+  # Одноразовый init-контейнер: создаёт бакет и разрешает скачивание объектов.
+  createbuckets:
+    image: minio/mc:latest
+    container_name: createbuckets
+    depends_on:
+      storage:
+        condition: service_healthy
+    # `alias set` — актуальный синтаксис mc.
+    # `anonymous set download` разрешает GET объектов без подписи SigV4.
+    entrypoint: >
+      /bin/sh -c "
+      sleep 2;
+      /usr/bin/mc alias set myminio http://storage:9000 ${Storage_AccessKey} ${Storage_Secret};
+      /usr/bin/mc mb --ignore-existing myminio/${Storage_Bucket};
+      /usr/bin/mc anonymous set download myminio/${Storage_Bucket};
+      exit 0;
+      "
+
+  # Принимает файл (POST /v1/upload), валидирует что это картинка, кладёт в minio.
+  uploader:
+    build: ./uploader
+    container_name: uploader
+    environment:
+      PORT: 3000
+      S3_HOST: storage
+      S3_PORT: 9000
+      S3_ACCESS_KEY: ${Storage_AccessKey}
+      S3_ACCESS_SECRET: ${Storage_Secret}
+      S3_BUCKET: ${Storage_Bucket}
+    depends_on:
+      storage:
+        condition: service_healthy
+
+  # Регистрация/логин/проверка JWT. Используется в auth_request шлюза.
+  security:
+    build: ./security
+    container_name: security
+    environment:
+      PORT: 3000
+
+  # Единственный сервис с опубликованным портом: 80 хоста -> 8080 контейнера.
+  gateway:
+    image: nginx:alpine
+    container_name: gateway
+    ports:
+      - "80:8080"
+    volumes:
+      # Конфиг монтируется read-only: правки не требуют пересборки образа.
+      - ./gateway/nginx.conf:/etc/nginx/nginx.conf:ro
+    depends_on:
+      - security
+      - uploader
+      - storage
+
+volumes:
+  storage-data:
